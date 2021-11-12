@@ -2,6 +2,7 @@
 
 #include <thread>
 #include <condition_variable>
+#include <functional>
 
 template<typename Element, unsigned int size>
 class Spigot {
