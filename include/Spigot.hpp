@@ -2,90 +2,140 @@
 
 #include <atomic>
 #include <thread>
-#include <condition_variable>
 #include <functional>
+#include <memory>
 
-template<typename Element, unsigned int size>
+
+template<typename Element, typename ProducerData, unsigned int size>
 class Spigot {
 
 private:
-
-    std::function<void(Element*)> Produce;
-    enum ThreadState { Paused, Running, Halted };
-    std::atomic<ThreadState> state;
-    std::mutex producerFunctionLock;
-    std::condition_variable stateChangedCondition;
-    std::thread producerThread;
-    Element buffer[size];
-    std::atomic<unsigned int> readIndex;
-    std::atomic<unsigned int> writeIndex;
+    
+    enum ThreadState { Running, PauseRequested, Paused, Halted };
 
 public:
 
-    inline Spigot() :
+    ProducerData producerData;
+
+private:
+
+    // TODO I might actually need pad bytes
+    Element* const buffer;
+    std::function<void(Element*, ProducerData*)> producerFunction;
+    std::thread producerThread;
+    alignas(64) std::atomic<ThreadState> state;
+    alignas(64) std::atomic<unsigned int> readIndex;
+    alignas(64) std::atomic<unsigned int> writeIndex;
+
+public:
+
+    explicit inline Spigot(std::function<void(Element*, ProducerData*)> target) :
+        buffer(static_cast<Element*>(std::malloc(sizeof(Element) * size))),
+        producerFunction(target),
         producerThread(&Spigot::ProducerThread, this),
+        state(Paused),
         readIndex(0),
         writeIndex(0) {
-        Pause();
+        // TODO raise bad_alloc maybe?
     }
+
+    // Spigot is non-copyable
+    Spigot(const Spigot&) = delete;
+    Spigot& operator=(const Spigot&) = delete;
 
     inline ~Spigot() {
-        Run();
-        state = Halted;
+        state.store(Halted, std::memory_order_release);
         producerThread.join();
+
+        // TODO Destroy stored objects. Spigot may not be around for the whole app
+        //      only dtor if not constexpr trivially-destructible
+
+        std::free(buffer);
     }
 
-    inline void SetProducer(std::function<void(Element*)> producerFunction) {
-        Produce = producerFunction;
-    }
-
+    /*
+     * Resume execution of the service thread. This makes it safe to call either
+     * Current or Advance, but unsafe to access producerData.
+     */
     inline void Run() {
-        if (state != Running) {
-            producerFunctionLock.unlock();
-            state = Running;
-            stateChangedCondition.notify_one();
-        }
+        state.store(Running, std::memory_order_release);
     }
 
+    /*
+     * Pause execution of the service thread. This makes it safe to access
+     * producerData, but unsafe to call either Current or Advance.
+     */
     inline void Pause() {
-        if (state != Paused) {
-            state = Paused;
-            producerFunctionLock.lock();
-            writeIndex = (readIndex + 1) % size;
-        }
+
+        // Store a pause request "eventually", and then aggressively spin until
+        // the service thread has written the pause state.
+        state.store(PauseRequested, std::memory_order_release);
+        while (state.load(std::memory_order_acquire) != Paused);
+
+        // TODO destroy objects in the queue if constexpr not trivially dtorable
+
+        readIndex.store(0, std::memory_order_release);
+        writeIndex.store(0, std::memory_order_release);
+
     }
 
+    /*
+     * Spin until the queue is not empty, and then return a pointer to the top
+     * Element in the queue. This will spin every time, so call it once and
+     * store the result in a local variable.
+     */
     inline Element* Current() {
-        while (readIndex == writeIndex);
-        return &buffer[readIndex];
+
+        // Spin until the buffer is not empty
+        const unsigned int loadedReadIndex = readIndex.load(std::memory_order_relaxed);
+        while (loadedReadIndex == writeIndex.load(std::memory_order_acquire));
+
+        // Return the now-safe pointer to the top of the queue
+        return &buffer[loadedReadIndex];
     }
 
-    inline Element* Next() {
-        readIndex = (readIndex + 1) % size;
-        return Current();
+    /*
+     * Destroy the top Element of the queue, guaranteeing that the next call to
+     * Current() will return the next Element of the queue.
+     */
+    inline void Advance() {
+
+        // Spin until the buffer is not empty
+        const unsigned int loadedReadIndex = readIndex.load(std::memory_order_relaxed);
+        while (loadedReadIndex == writeIndex.load(std::memory_order_acquire));
+
+        // Destroy the top-of-queue object
+        if constexpr (!std::is_trivially_destructible<Element>::value) {
+            buffer[loadedReadIndex].~T();
+        }
+
+        // Advance the read index
+        unsigned int nextReadIndex = (loadedReadIndex + 1) % size;
+        readIndex.store(nextReadIndex, std::memory_order_release);
     }
 
 private:
 
     inline void ProducerThread() {
-
-        std::unique_lock<std::mutex> lk(producerFunctionLock);
-
         while (true) {
+            const unsigned int loadedWriteIndex = writeIndex.load(std::memory_order_relaxed);
+            unsigned int nextWriteIndex = (loadedWriteIndex + 1) % size;
 
-            while (state != Running) {
-                stateChangedCondition.wait(lk);
-                if (state == Halted) {
+            ThreadState sampledState = state.load(std::memory_order_acquire);
+            unsigned int loadedReadIndex = readIndex.load(std::memory_order_acquire);
+            while (loadedReadIndex == nextWriteIndex || sampledState != Running) {
+                if (sampledState == Halted) {
                     return;
                 }
+                sampledState = state.load(std::memory_order_acquire);
+                loadedReadIndex = readIndex.load(std::memory_order_acquire);
             }
 
-            if (((writeIndex + 1) % size) != readIndex) {
-                Produce(&buffer[writeIndex]);
-                writeIndex = (writeIndex + 1) % size;
-                continue;
-            }
+            // Produce a new element into the queue
+            producerFunction(&buffer[loadedWriteIndex], &producerData);
 
+            // Advance the write index
+            writeIndex.store(nextWriteIndex, std::memory_order_release);
         }
     }
 };
